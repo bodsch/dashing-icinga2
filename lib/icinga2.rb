@@ -44,6 +44,7 @@ class Icinga2
   # host stats
   attr_reader :host_count_all
   attr_reader :host_count_problems
+  attr_reader :host_count_problems_down
   attr_reader :host_count_up
   attr_reader :host_count_down
   attr_reader :host_count_in_downtime
@@ -52,6 +53,9 @@ class Icinga2
   # service stats
   attr_reader :service_count_all
   attr_reader :service_count_problems
+  attr_reader :service_count_problems_warning
+  attr_reader :service_count_problems_critical
+  attr_reader :service_count_problems_unknown
   attr_reader :service_count_ok
   attr_reader :service_count_warning
   attr_reader :service_count_critical
@@ -155,29 +159,45 @@ class Icinga2
     end
   end
 
-  def getIcingaApplicationData()
-    apiUrl = sprintf('%s/status/IcingaApplication', @apiUrlBase)
+  def getApiData(apiUrl, requestBody = nil)
     restClient = RestClient::Resource.new(URI.encode(apiUrl), @options)
-    max_retries   = 30
-    times_retried = 0
+
+    maxRetries = 30
+    retried = 0
 
     begin
-      data = JSON.parse(restClient.get(@headers).body)
+      if requestBody
+        @headers["X-HTTP-Method-Override"] = "GET"
+        payload = JSON.generate(requestBody)
+        res = restClient.post(payload, @headers)
+      else
+        res = restClient.get(@headers)
+      end
     rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
-
-      if( times_retried < max_retries )
-        times_retried += 1
-        $stderr.puts(format( 'Cannot execute request %s', apiUrl ))
-        $stderr.puts(format( '   cause: %s', e ))
-        $stderr.puts(format( '   retry %d / %d', times_retried, max_retries ))
-
-        sleep( 4 )
+      if (retried < maxRetries)
+        retried += 1
+        $stderr.puts(format("Cannot execute request against '%s': '%s' (retry %d / %d)", apiUrl, e, retried, maxRetries))
+        sleep(2)
         retry
       else
-        $stderr.puts( 'Exiting request ...' )
-
+        $stderr.puts("Maximum retries (%d) against '%s' reached. Giving up ...", maxRetries, apiUrl)
         return nil
       end
+    end
+
+    body = res.body
+    data = JSON.parse(body)
+
+    return data
+  end
+
+  def getIcingaApplicationData()
+    apiUrl = sprintf('%s/status/IcingaApplication', @apiUrlBase)
+
+    data = getApiData(apiUrl)
+
+    if not data or not data.has_key?('results') or data['results'].empty? or not data['results'][0].has_key?('status')
+      return nil
     end
 
     return data['results'][0]['status'] #there's only one row
@@ -185,37 +205,30 @@ class Icinga2
 
   def getCIBData()
     apiUrl = sprintf('%s/status/CIB', @apiUrlBase)
-    restClient = RestClient::Resource.new(URI.encode(apiUrl), @options)
-    max_retries   = 30
-    times_retried = 0
 
-    begin
-      data = JSON.parse(restClient.get(@headers).body)
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
+    data = getApiData(apiUrl)
 
-      if( times_retried < max_retries )
-        times_retried += 1
-        $stderr.puts(format( 'Cannot execute request %s', apiUrl ))
-        $stderr.puts(format( '   cause: %s', e ))
-        $stderr.puts(format( '   retry %d / %d', times_retried, max_retries ))
-
-        sleep( 4 )
-        retry
-      else
-        $stderr.puts( 'Exiting request ...' )
-
-        return nil
-      end
+    if not data or not data.has_key?('results') or data['results'].empty? or not data['results'][0].has_key?('status')
+      return nil
     end
 
     return data['results'][0]['status'] #there's only one row
   end
 
+  def getStatusData()
+    apiUrl = sprintf('%s/status', @apiUrlBase)
+    data = getApiData(apiUrl)
+
+    if not data or not data.has_key?('results')
+      return nil
+    end
+
+    return data['results']
+  end
+
   def getHostObjects(attrs = nil, filter = nil, joins = nil)
     apiUrl = sprintf('%s/objects/hosts', @apiUrlBase)
-    restClient = RestClient::Resource.new(URI.encode(apiUrl), @options)
 
-    @headers["X-HTTP-Method-Override"] = "GET"
     requestBody = {}
 
     if (attrs)
@@ -230,18 +243,19 @@ class Icinga2
       requestBody["joins"] = joins
     end
 
-    payload = JSON.generate(requestBody)
-    res = restClient.post(payload, @headers)
-    body = res.body
-    data = JSON.parse(body)
+    # fetch data with requestBody (which means X-HTTP-Method-Override: GET)
+    data = getApiData(apiUrl, requestBody)
+
+    if not data or not data.has_key?('results')
+      return nil
+    end
+
     return data['results']
   end
 
   def getServiceObjects(attrs = nil, filter = nil, joins = nil)
     apiUrl = sprintf('%s/objects/services', @apiUrlBase)
-    restClient = RestClient::Resource.new(URI.encode(apiUrl), @options)
 
-    @headers["X-HTTP-Method-Override"] = "GET"
     requestBody = {}
 
     if (attrs)
@@ -260,16 +274,33 @@ class Icinga2
 
     #puts "request body: " + requestBody.to_s
 
-    payload = JSON.generate(requestBody)
-    res = restClient.post(payload, @headers)
-    body = res.body
-    data = JSON.parse(body)
+    # fetch data with requestBody (which means X-HTTP-Method-Override: GET)
+    data = getApiData(apiUrl, requestBody)
+
+    if not data or not data.has_key?('results')
+      return nil
+    end
+
     return data['results']
   end
 
   def formatService(name)
     service_map = name.split('!', 2)
     return service_map[0].to_s + " - " + service_map[1].to_s
+  end
+
+  def stateFromString(stateStr)
+    if (stateStr == "Down" or stateStr == "Warning")
+      return 1
+    elif (stateStr == "Up" or stateStr == "OK")
+      return 0
+    elif (stateStr == "Critical")
+      return 2
+    elif (stateStr == "Unknown")
+      return 3
+    end
+
+    return "Undefined state. Programming error."
   end
 
   def stateToString(state, is_host = false)
@@ -308,8 +339,18 @@ class Icinga2
     return "Undefined state. Programming error."
   end
 
-  def countProblems(objects)
+  def countProblems(objects, states = nil)
     problems = 0
+
+    compStates = []
+
+    if not states
+      compStates = [ 1, 2, 3]
+    end
+
+    if states.is_a?(Integer)
+      compStates.push(states)
+    end
 
     objects.each do |item|
       item.each do |k, d|
@@ -317,7 +358,7 @@ class Icinga2
           next
         end
 
-        if (d["state"] != 0 && d["downtime_depth"] == 0 && d["acknowledgement"] == 0)
+        if (compStates.include?(d["state"]) && d["downtime_depth"] == 0 && d["acknowledgement"] == 0)
           problems = problems + 1
         end
       end
@@ -420,11 +461,8 @@ class Icinga2
     return severity
   end
 
-  def getProblemServices(max_items = 5)
-    @service_problems = {}
-
-    # only fetch the minimal attribute set required for severity calculation
-    all_services_data = getServiceObjects([ "name", "state", "acknowledgement", "downtime_depth", "last_check" ], nil, [ "host.name", "host.state", "host.acknowledgement", "host.downtime_depth", "host.last_check" ])
+  def getProblemServices(all_services_data, max_items = 20)
+    service_problems = {}
 
     all_services_data.each do |service|
       #puts "Severity for " + service["name"] + ": " + getServiceSeverity(service).to_s
@@ -432,27 +470,68 @@ class Icinga2
         next
       end
 
-      @service_problems[service] = getServiceSeverity(service)
+      service_problems[service] = getServiceSeverity(service)
     end
 
     count = 0
-    @service_problems_severity = {}
+    service_problems_severity = {}
 
     # debug
     #@service_problems.sort_by {|k, v| v}.reverse.each do |obj, severity|
     #  puts obj["name"] + ": " + severity.to_s
     #end
 
-    @service_problems.sort_by {|k, v| v}.reverse.each do |obj, severity|
+    service_problems.sort_by {|k, v| v}.reverse.each do |obj, severity|
       if (count >= max_items)
         break
       end
 
       name = obj["name"]
-      @service_problems_severity[name] = obj["attrs"]["state"]
+      service_problems_severity[name] = obj["attrs"]["state"]
 
       count += 1
     end
+
+    return service_problems, service_problems_severity
+  end
+
+  def getWQStats()
+    results = getStatusData()
+
+    stats = {}
+
+    results.each do |r|
+      status = r["status"]
+
+      keyList = [ "work_queue_item_rate", "query_queue_item_rate" ]
+
+      # structure is "type" - "name"
+      # api - json_rpc
+      # idomysqlconnection - ido-mysql
+      status.each do |type, typeval|
+        if not typeval.is_a?(Hash)
+          next
+        end
+
+        typeval.each do |attr, val|
+          #puts attr + " " + val.to_s
+
+          if not val.is_a?(Hash)
+            next
+          end
+
+          keyList.each do |key|
+            if val.has_key? key
+              attrName = attr + " queue rate"
+              stats[attrName] = val[key]
+            end
+          end
+
+        end
+      end
+    end
+
+    return stats
   end
 
   def fetchVersion(version)
@@ -470,6 +549,49 @@ class Icinga2
     end
 
     @version = version_str
+  end
+
+  def initializeAttributes()
+    @version = "Not running"
+    @version_revision = ""
+    @node_name = ""
+    @app_starttime = 0
+    @uptime = 0
+
+    @avg_latency = 0
+    @avg_execution_time = 0
+    @host_active_checks_1min = 0
+    @host_passive_checks_1min = 0
+    @service_active_checks_1min = 0
+    @service_passive_checks_1min = 0
+
+    @service_problems_severity = 0
+
+    @host_count_all = 0
+    @host_count_problems = 0
+    @host_count_problems_down = 0
+    @host_count_up = 0
+    @host_count_down = 0
+    @host_count_in_downtime = 0
+    @host_count_acknowledged = 0
+
+    @service_count_all = 0
+    @service_count_problems = 0
+    @service_count_problems_warning = 0
+    @service_count_problems_critical = 0
+    @service_count_problems_unknown = 0
+    @service_count_ok = 0
+    @service_count_warning = 0
+    @service_count_critical = 0
+    @service_count_unknown = 0
+    @service_count_unknown = 0
+    @service_count_in_downtime = 0
+    @service_count_acknowledged = 0
+
+    @app_data = nil
+    @cib_data = nil
+    @all_hosts_data = nil
+    @all_services_data = nil
   end
 
   def run
@@ -553,5 +675,6 @@ class Icinga2
 
     # severity
     getProblemServices()
+
   end
 end
