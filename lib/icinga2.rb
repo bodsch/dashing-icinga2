@@ -350,27 +350,27 @@ class Icinga2
 
     compStates = []
 
-    if not states
-      compStates = [ 1, 2, 3]
+    unless( states.nil? )
+      # 0 = "Up"   or "OK"
+      # 1 = "Down" or "Warning"
+      # 2 = "Critical"
+      # 3 = "Unknown"
+      compStates = [1, 2, 3]
     end
 
-    if states.is_a?(Integer)
-      compStates.push(states)
-    end
+    compStates.push(states) if( states.is_a?(Integer) )
 
-    objects.each do |item|
-      item.each do |k, d|
-        if (k != "attrs")
-          next
-        end
+    objects = JSON.parse(objects) if objects.is_a?(String)
 
-        if (compStates.include?(d["state"]) && d["downtime_depth"] == 0 && d["acknowledgement"] == 0)
-          problems = problems + 1
-        end
-      end
-    end
+    f = objects.select { |t|
+                          t['attrs'] && t['attrs']['state'] == state &&
+                          ( t['attrs'] && ( !t['attrs']['downtime_depth'].nil?  && t['attrs']['downtime_depth'].zero? ) ) &&
+                          ( t['attrs'] && ( !t['attrs']['acknowledgement'].nil? && t['attrs']['acknowledgement'].zero? ) )
+                       }
 
-    return problems
+    # ruby 2.3 style are easier:
+    # f = objects.select { |t| t.dig('attrs','state') == state && ( !t.dig('attrs','downtime_depth').nil? && t.dig('attrs','downtime_depth').zero?) && ( !t.dig('attrs','acknowledgement').nil? && t.dig('attrs','acknowledgement').zero? ) }
+    f.size
   end
 
   # use last_check here, takes less traffic than the entire check result
